@@ -1,0 +1,17 @@
+# Google Drive / OS artifacts
+desktop.ini
+Thumbs.db
+.DS_Store
+*.gdoc
+*.gsheet
+*.gslides
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Secrets
+.env
+.env.*
+!.env.example
