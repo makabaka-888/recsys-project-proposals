@@ -181,13 +181,74 @@ Each of these is a measured experiment with a documented decision:
 
 Output: a Pareto write-up with a recommended CPU-only profile and a GPU profile.
 
-### 6.9 Deployment & Operability
-- **`docker compose up`** brings up `api`, `worker` (ingestion/embedding), `postgres` (metadata, feedback), `redis` (cache), and either `ollama`/`vllm` or in-process llama.cpp for the LLM.
-- Model weights baked into an image layer or mounted volume, **pinned by revision hash**; runtime has no registry access.
-- **Egress test in CI**: run the stack on an internal-only Docker network with no default route, execute a golden query set, assert correct answers and zero outbound connection attempts. This test *is* the product guarantee.
+### 6.9 Deployment Topology — macOS Is the Primary Development Target
+
+The reference development machine is an **Apple Silicon Mac**, which constrains the topology in one non-obvious way:
+
+> **Docker containers on macOS cannot reach the GPU.** Docker Desktop runs a Linux VM and Metal is not passed through. Putting model inference inside a container on a Mac silently discards all Apple Silicon acceleration and leaves VM-bound CPU inference — which makes the reranker unusable.
+
+Therefore the deployment is **split by concern**, not uniformly containerized:
+
+| Component | Where it runs on macOS | Where it runs on a Linux server |
+|---|---|---|
+| Embedder, reranker, LLM | **Native on the host** (venv / Ollama app), using Metal via MPS or MLX | In-container (CPU or CUDA) |
+| API, worker | Native during development; containerized for release | In-container |
+| Postgres, Redis | **Container** (no GPU needed, trivially portable) | In-container |
+
+One `compose` file for the stateful services plus a native model runtime is the standard Mac development pattern, and it keeps the Linux production path unchanged. `make dev` (native models) and `make prod` (all-container) select the profile.
+
+**This is a design deliverable, not a workaround**: the inference layer sits behind one interface with pluggable backends, so the same code runs accelerated on a Mac and quantized on a Linux CPU host. Cross-platform inference abstraction is genuinely uncommon in a portfolio project and is straightforward to discuss in an interview.
+
+### 6.10 Apple Silicon Inference Backends
+
+| Backend | Use for | Notes |
+|---|---|---|
+| **PyTorch MPS** | Embedder + reranker, baseline path | Simplest route; a few ops still fall back to CPU, harmless at 0.6B |
+| **MLX** (`mlx-lm`, `mlx-embeddings`) | Embedder + reranker + LLM, fast path | Apple's own array framework; built for unified memory and typically the fastest option on M-series. Shipping an MLX path is the distinctive piece of engineering here. |
+| **llama.cpp / Ollama (Metal)** | LLM synthesis | Metal enabled by default; GGUF Q4_K_M for Qwen3-4B-Instruct |
+| **ONNX Runtime, INT8 dynamic** | Linux/x86 CPU hosts | The portable fallback; arm64 wheels exist but the quantization kernels differ from x86, so measure both rather than assuming parity |
+
+**Vector index reconsidered for arm64.** FAISS on Apple Silicon is workable (conda-forge, or recent pip wheels) but historically the most fragile dependency in this stack. At the scale here — roughly 10⁵–10⁶ vectors — the alternatives are all adequate and much easier to install:
+
+- **`usearch`** or **`hnswlib`** — small, arm64-friendly, HNSW indexes
+- **`sqlite-vec`** — vectors alongside metadata in one file, extremely simple to operate
+- **NumPy brute force** — at 100k × 256 dims an exact scan is milliseconds; a perfectly honest baseline
+
+Decision: keep the index behind an interface, ship `usearch` as the default, and retain FAISS as one option **inside** the index-family benchmark rather than as a hard dependency. The benchmark section of the project is unchanged; only the default choice moves.
+
+### 6.11 Latency Budget on Apple Silicon
+
+The reranker dominates, so the budget is built around it. Cross-encoding *N* passages costs roughly *N* forward passes of a 0.6B model — reducing *N* and shortening sequences are the two levers that matter.
+
+| Lever | Setting for the Mac profile |
+|---|---|
+| Rerank depth | Expect the quality/latency knee **lower than on GPU** — likely top-25 to top-50 rather than top-100. Measured, not assumed. |
+| Passage truncation | 256–384 tokens instead of 512; measure the NDCG cost |
+| Batching | Batch by sequence length; single-pass over the whole candidate set |
+| Conditional reranking | Skip stage 2 when stage-1 scores are already unambiguous — most queries are easy |
+| Matryoshka dims | 256 dims keeps the index small and search near-instant at this corpus size |
+| Caching | Redis on normalized query; documentation queries repeat heavily |
+
+**Sprint 1 gate.** Before building further, measure on the actual machine: single-passage rerank latency, and end-to-end `/v1/search` P99 at depth 25/50/100. If P99 at the chosen depth exceeds ~2 s interactively, respond by lowering depth, shortening truncation, or enabling conditional reranking — in that order. This is a go/no-go checkpoint, so the constraint is discovered in week 2 rather than week 9.
+
+### 6.12 Memory Profiles
+
+Apple Silicon unified memory is shared between CPU and GPU, so model weights, the index, and the OS all draw on the same pool.
+
+| Machine | Configuration | Models resident |
+|---|---|---|
+| **16 GB M-series** (target) | Full stack | Embedder 0.6B + reranker 0.6B (~2.4 GB fp16) + Qwen3-4B Q4 (~2.5 GB) ≈ **5 GB**, plus index and containers — comfortable |
+| **8 GB M-series** | Reduced | Swap synthesis to Qwen3-1.7B Q4 (~1.1 GB), load embedder and reranker on demand rather than keeping both resident |
+| **Intel Mac** | Degraded | No Metal for these paths; CPU-only via ONNX INT8. Workable for the eval loop on SciFact, painful interactively — document it as unsupported rather than pretending otherwise |
+
+Total model weights on disk ≈ 5 GB; corpus and index for the demo set well under 5 GB.
+
+### 6.13 Operability
+- `compose` brings up `postgres` (metadata, feedback) and `redis` (cache); model runtime is native on macOS and containerized on Linux.
+- Model weights fetched once into a local cache directory, **pinned by revision hash**; runtime never reaches Hugging Face.
+- **Egress test in CI**: run the stack with outbound network access blocked (internal-only Docker network for the Linux profile; a network-disabled test harness on macOS), execute a golden query set, assert correct answers and zero outbound connection attempts. This test *is* the product guarantee.
 - Prometheus metrics: per-stage latency histograms, QPS, cache hit rate, rerank depth, abstention rate, hops per query, tokens/sec. Grafana dashboards for service health and answer quality.
-- Locust load tests reported per profile (CPU-only vs. GPU).
-- Hardware tiers documented: **minimum 16 GB RAM, CPU-only**; recommended 8–12 GB VRAM GPU. Total model disk ≈ 5 GB.
+- Locust load tests reported **per profile**: macOS/Metal, Linux CPU (INT8), Linux GPU. The cross-profile table is itself a result worth showing.
 
 ## 7. Evaluation Plan
 
