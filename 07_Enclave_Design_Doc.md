@@ -254,21 +254,53 @@ Containerizing inference would therefore mean losing acceleration on macOS and a
 
 Developer experience is identical on both platforms: `uv sync`, `docker compose up db redis`, `ollama pull <model>`, then one Python entry point. `compose --profile release` runs everything containerized for the Linux target, so the production path stays fully containerized without hurting laptop development.
 
-### 6.9 Memory & Hardware Profiles
+### 6.9 Asymmetric Hardware — the Weakest Machine Sets the Defaults
+
+The development fleet is deliberately uneven: a **Windows workstation with an NVIDIA GPU** and a **Mac without one**. That asymmetry is the single most likely way this project quietly breaks, so it is handled as an explicit design rule rather than left to discipline.
+
+> **Rule: the default configuration profile is tuned for the GPU-less machine. CUDA is an opt-in accelerator, never an assumption.**
+
+Tuning the defaults for CUDA is the obvious mistake. It produces a config the Mac cannot serve, and since **GitHub Actions offers no free GPU runners**, CI would catch correctness drift but never performance drift — the Mac would rot silently until a demo failed.
+
+**Two named profiles, and the slow one is the default:**
+
+| | `portable` (default) | `accelerated` (opt-in) |
+|---|---|---|
+| Encoders | ONNX INT8, or PyTorch MPS on Apple Silicon | PyTorch CUDA fp16 |
+| Rerank depth | conservative (expect top-25 to top-50) | higher, from its own measured knee |
+| Passage truncation | 256–320 tokens | 384–512 tokens |
+| Conditional reranking | **on** | optional |
+| Embedding dims (Matryoshka) | 256 | 512 or 1024 |
+| Synthesis model | Qwen3-4B Q4, or Qwen3-1.7B Q4 on 8 GB | Llama-3.1-8B Q4 |
+
+Selected by one environment variable. The interactive latency target — P99 under ~2 s for `/v1/search` — is measured **on the Mac**, and the Windows machine simply has headroom above it.
+
+**Division of labor, which is also how real teams work:**
+
+| Machine | Owns |
+|---|---|
+| **Mac (no GPU)** | Interactive development, the demo, and the portability guarantee. Defines the latency budget. |
+| **Windows + NVIDIA** | Heavy offline jobs: LoRA fine-tuning, full BEIR sweeps, the index and quantization studies, batch embedding of the corpus |
+
+A laptop for development and a GPU box for training is the standard industrial setup, so this is worth describing in interviews rather than apologising for. Artifacts cross the boundary as files — trained adapters, exported ONNX graphs, precomputed embeddings — all of which load fine on the Mac even though it could not have produced them quickly.
+
+**Hardware profiles in detail:**
 
 | Machine | Encoders | Synthesis model | Notes |
 |---|---|---|---|
-| **Windows, 16 GB, NVIDIA ≥8 GB VRAM** | CUDA fp16 | Llama-3.1-8B Q4 (~4.9 GB) | Best profile; rerank depth can stay high |
-| **Windows, 16 GB, CPU only** | ONNX INT8 (~0.6 GB each) | Qwen3-4B Q4 (~2.5 GB) | Lower rerank depth; conditional reranking on |
-| **macOS Apple Silicon, 16 GB** | MPS fp16 (~2.4 GB both) | Llama-3.1-8B Q4 or Qwen3-4B Q4 | Unified memory shared with the OS; leave headroom |
-| **macOS / Windows, 8 GB** | load on demand, INT8 | Qwen3-1.7B Q4 (~1.1 GB) | Interactive but constrained; eval loop still fine |
-| **Intel Mac** | CPU only | Qwen3-1.7B Q4 | Documented as best-effort, not a supported profile |
+| **Windows, 16 GB, NVIDIA ≥8 GB VRAM** | CUDA fp16 | Llama-3.1-8B Q4 (~4.9 GB) | `accelerated`; owns training and sweeps |
+| **macOS Apple Silicon, 16 GB** | MPS fp16 (~2.4 GB both) | Qwen3-4B Q4 (~2.5 GB) | `portable`; the reference interactive machine |
+| **macOS Apple Silicon, 8 GB** | INT8, loaded on demand | Qwen3-1.7B Q4 (~1.1 GB) | Constrained but usable; eval loop unaffected |
+| **Intel Mac** | ONNX INT8, CPU only — **no MPS at all** | Qwen3-1.7B Q4 | Degraded: correctness and the SciFact eval loop are fine, interactive answering is slow. Documented as best-effort, not a supported profile. |
 
-Model weights on disk: ~2.5 GB encoders plus 1–5 GB per synthesis model. Demo corpus and Postgres data well under 5 GB.
+Model weights on disk: ~2.5 GB encoders plus 1–5 GB per synthesis model. Demo corpus and Postgres data stay well under 5 GB.
+
+**What this buys, stated as an engineering result**: a system whose default configuration is provably serviceable on a laptop with no accelerator, with a documented upgrade path that spends a GPU on throughput rather than on making the product work at all.
 
 ### 6.10 Operability & CI
 
 - **Three-OS CI matrix** on GitHub Actions: `windows-latest`, `macos-14` (arm64), `ubuntu-latest`. Unit tests, a small end-to-end retrieval test on SciFact, and lint run on all three. *(Note: macOS runner minutes carry a multiplier on private repositories — run the macOS job on pull requests to `main` and nightly rather than on every push.)*
+- **CI validates correctness, not speed.** GitHub-hosted runners have no GPU, so the matrix proves the code runs everywhere and returns the same results — it cannot catch latency regressions. Performance is therefore measured locally on both machines and **checked into the repo as a versioned benchmark table**, so a regression is visible in a diff. This split is stated explicitly rather than letting a green matrix imply more than it proves.
 - **Egress test**: run the stack with outbound access blocked — internal-only Docker network on Linux, a network-disabled harness on Windows and macOS — execute a golden query set, and assert both correct answers and zero outbound connection attempts. This test *is* the product guarantee.
 - Model weights fetched once into a local cache, **pinned by revision hash**; runtime never contacts Hugging Face or any registry.
 - Prometheus metrics: per-stage latency histograms, QPS, cache hit rate, rerank depth, abstention rate, hops per query, tokens/sec. Grafana dashboards for service health and answer quality.
