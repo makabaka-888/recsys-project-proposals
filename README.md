@@ -8,7 +8,7 @@ Design documents for 1:1 mentoring projects in **recommendation systems, search 
 
 | # | Project | Domain | Headline technique |
 |---|---|---|---|
-| [01](01_FeedForge_Design_Doc.md) | **FeedForge** | News / short-video feed | Two-tower retrieval + DeepFM ranking + LLM re-ranking on MIND impression logs |
+| [01](01_FeedForge_Design_Doc.md) | **FeedForge** | News / short-video feed | Content-tower two-tower retrieval + DIN ranking + LLM enrichment / async re-rank on MIND impression logs, specified end to end: streaming features with a parity test, honest log replay, layered A/B, release bundles |
 | [02](02_ShopBrain_Design_Doc.md) | **ShopBrain** | E-commerce | SASRec sequential recs + semantic-ID generative retrieval + LLM shopping assistant |
 | [03](03_TuneFlow_Design_Doc.md) | **TuneFlow** | Music streaming | SASRec / BERT4Rec next-track prediction + LLM playlist generation |
 | [04](04_SearchCraft_Design_Doc.md) | **SearchCraft** | E-commerce search | Hybrid BM25 + dense retrieval, LambdaMART, contract-first API design |
